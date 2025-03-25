@@ -9,13 +9,11 @@ const path = require("path");
 
 const app = express();
 app.use(express.json());
-app.use(cors());
-
 app.use(cors({
   origin: "http://localhost:3000",
   credentials: true,
   allowedHeaders: ["Content-Type", "Authorization"],
-}))
+}));
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -64,17 +62,8 @@ const UserInfo = userInfoDB.model("UserInfo", userInfoSchema);
 const patientTransferSchema = new mongoose.Schema({
   hospitalName: { type: String, required: true },
   service: { type: String, required: true },
-  doctor: {
-    name: String,
-    contact: String,
-    hospitalName: String,
-    specialization: String,
-  },
-  patients: [{
-    name: { type: String, required: true },
-    age: { type: Number, required: true },
-    height: { type: Number, required: true },
-  }],
+  doctor: { name: String, contact: String, hospitalName: String, specialization: String },
+  patients: [{ name: { type: String, required: true }, age: { type: Number, required: true }, height: { type: Number, required: true } }],
   transferDate: { type: Date, required: true },
 });
 
@@ -83,37 +72,91 @@ const PatientTransfer = userInfoDB.model("PatientTransfer", patientTransferSchem
 const resourceBookingSchema = new mongoose.Schema({
   hospitalName: { type: String, required: true },
   resourceType: { type: String, required: true },
-  doctor: {
-    name: String,
-    contact: String,
-    hospitalName: String,
-    specialization: String,
-  },
-  bookings: [{
-    resource: { type: String, required: true },
-    quantity: { type: Number, required: true },
-  }],
+  doctor: { name: String, contact: String, hospitalName: String, specialization: String },
+  bookings: [{ resource: { type: String, required: true }, quantity: { type: Number, required: true } }],
   bookingDate: { type: Date, required: true },
 });
 
 const ResourceBooking = userInfoDB.model("ResourceBooking", resourceBookingSchema);
 
+const centralDB = mongoose.createConnection(process.env.MONGO_URI_CENTRAL, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
+
+centralDB.on("connected", async () => {
+  console.log("✅ MongoDB Central Connected");
+  const dbName = centralDB.name;
+  console.log("Connected to database:", dbName);
+  const collections = await centralDB.db.listCollections().toArray();
+  console.log("Collections in database:", collections.map(c => c.name));
+});
+
+centralDB.on("error", (err) => console.error("❌ MongoDB Central Connection Error:", err));
+
+const hospitalADB = mongoose.createConnection(process.env.MONGO_URI_A, { useNewUrlParser: true, useUnifiedTopology: true });
+hospitalADB.on("connected", () => console.log("✅ MongoDB Hospital-A Connected"));
+hospitalADB.on("error", (err) => console.error("❌ MongoDB Hospital-A Connection Error:", err));
+
+const hospitalBDB = mongoose.createConnection(process.env.MONGO_URI_B, { useNewUrlParser: true, useUnifiedTopology: true });
+hospitalBDB.on("connected", () => console.log("✅ MongoDB Hospital-B Connected"));
+hospitalBDB.on("error", (err) => console.error("❌ MongoDB Hospital-B Connection Error:", err));
+
+const hospitalCDB = mongoose.createConnection(process.env.MONGO_URI_C, { useNewUrlParser: true, useUnifiedTopology: true });
+hospitalCDB.on("connected", () => console.log("✅ MongoDB Hospital-C Connected"));
+hospitalCDB.on("error", (err) => console.error("❌ MongoDB Hospital-C Connection Error:", err));
+
+const hospitalDBs = {
+  "government hospital thrissur": { db: hospitalADB, id: 'A123' },
+  "city hospital kochi": { db: hospitalBDB, id: 'B456' },
+  "general hospital kottayam": { db: hospitalCDB, id: 'C789' },
+};
+
+const syncHospitalsToCentral = async () => {
+  try {
+    const hospitalData = [
+      { db: hospitalADB, id: 'A123', name: "government hospital thrissur" },
+      { db: hospitalBDB, id: 'B456', name: "city hospital kochi" },
+      { db: hospitalCDB, id: 'C789', name: "general hospital kottayam" },
+    ];
+
+    for (const { db, id, name } of hospitalData) {
+      const hospitalData = await db.collection("resources").findOne({ hospital_id: id });
+      const centralData = await centralDB.collection("resources").findOne({ hospital_id: id });
+
+      if (hospitalData) {
+        const hospitalLastUpdated = hospitalData.last_updated || new Date(0);
+        const centralLastUpdated = centralData?.last_updated || new Date(0);
+
+        if (hospitalLastUpdated > centralLastUpdated) {
+          const { _id, ...syncData } = hospitalData;
+          await centralDB.collection("resources").updateOne(
+            { hospital_id: id },
+            { $set: { ...syncData, name, last_updated: new Date(hospitalLastUpdated) } },
+            { upsert: true }
+          );
+          console.log(`Synced ${name} to central DB`);
+        }
+      }
+    }
+  } catch (error) {
+    console.error("❌ Error syncing hospitals to central DB:", error.message);
+  }
+};
+
+setInterval(syncHospitalsToCentral, 1000);
+
 module.exports = { firebaseDB, userInfoDB };
 
 const verifyFirebaseToken = async (req, res, next) => {
   const token = req.headers.authorization?.split(" ")[1];
-
   if (!token) return res.status(401).json({ message: "Unauthorized: No Token Provided" });
 
   try {
     const decodedToken = await admin.auth().verifyIdToken(token);
     req.user = decodedToken;
-
     const firebaseUser = await firebaseDB.collection("users").findOne({ uid: decodedToken.uid });
-    if (firebaseUser) {
-      req.user.email = firebaseUser.email;
-    }
-
+    if (firebaseUser) req.user.email = firebaseUser.email;
     next();
   } catch (error) {
     res.status(403).json({ message: "Unauthorized: Invalid Token" });
@@ -138,17 +181,12 @@ app.post("/api/userinfo", verifyFirebaseToken, async (req, res) => {
 });
 
 app.post("/api/upload-profile-image", verifyFirebaseToken, upload.single("file"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ message: "No file uploaded" });
-  }
+  if (!req.file) return res.status(400).json({ message: "No file uploaded" });
 
   const imageUrl = `http://localhost:5000/uploads/${req.file.filename}`;
-
   try {
     const { email } = req.user;
-    if (!email) {
-      return res.status(400).json({ message: "User email not found" });
-    }
+    if (!email) return res.status(400).json({ message: "User email not found" });
 
     const result = await UserInfo.updateOne(
       { email },
@@ -180,9 +218,7 @@ app.put("/api/userinfo", verifyFirebaseToken, async (req, res) => {
       { new: true, runValidators: true }
     );
 
-    if (!updatedUser) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!updatedUser) return res.status(404).json({ message: "User not found" });
 
     res.status(200).json({ message: "Profile updated successfully", user: updatedUser });
   } catch (error) {
@@ -199,10 +235,9 @@ app.post("/api/patient-transfer", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
-    const trimmedHospitalName = hospitalName.trim();
+    const trimmedHospitalName = hospitalName.trim().toLowerCase();
     console.log("Received hospitalName for transfer:", trimmedHospitalName);
 
-    // Query the 'resources' collection instead of 'central-data'
     const hospital = await centralDB.collection("resources").findOne({
       name: { $regex: `^${trimmedHospitalName}$`, $options: "i" }
     });
@@ -226,10 +261,21 @@ app.post("/api/patient-transfer", verifyFirebaseToken, async (req, res) => {
     }
 
     const updatedBeds = { ...hospital.beds, [serviceKey]: availableBeds - requestedBeds };
+    const updateTime = new Date();
     await centralDB.collection("resources").updateOne(
       { name: hospital.name },
-      { $set: { beds: updatedBeds, last_updated: new Date() } }
+      { $set: { beds: updatedBeds, last_updated: updateTime } }
     );
+
+    // Sync back to the individual hospital database
+    const hospitalInfo = hospitalDBs[trimmedHospitalName];
+    if (hospitalInfo) {
+      await hospitalInfo.db.collection("resources").updateOne(
+        { hospital_id: hospitalInfo.id },
+        { $set: { beds: updatedBeds, last_updated: updateTime } }
+      );
+      console.log(`Updated ${hospital.name} in hospital DB`);
+    }
 
     const transfer = new PatientTransfer({
       hospitalName: hospital.name,
@@ -255,10 +301,9 @@ app.post("/api/resource-booking", verifyFirebaseToken, async (req, res) => {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
-    const trimmedHospitalName = hospitalName.trim();
+    const trimmedHospitalName = hospitalName.trim().toLowerCase();
     console.log("Received hospitalName for booking:", trimmedHospitalName);
 
-    // Query the 'resources' collection instead of 'central-data'
     const hospital = await centralDB.collection("resources").findOne({
       name: { $regex: `^${trimmedHospitalName}$`, $options: "i" }
     });
@@ -292,10 +337,21 @@ app.post("/api/resource-booking", verifyFirebaseToken, async (req, res) => {
       updatedResources[resourceKey] -= parseInt(booking.quantity, 10);
     }
 
+    const updateTime = new Date();
     await centralDB.collection("resources").updateOne(
       { name: hospital.name },
-      { $set: { [resourceField]: updatedResources, last_updated: new Date() } }
+      { $set: { [resourceField]: updatedResources, last_updated: updateTime } }
     );
+
+    // Sync back to the individual hospital database
+    const hospitalInfo = hospitalDBs[trimmedHospitalName];
+    if (hospitalInfo) {
+      await hospitalInfo.db.collection("resources").updateOne(
+        { hospital_id: hospitalInfo.id },
+        { $set: { [resourceField]: updatedResources, last_updated: updateTime } }
+      );
+      console.log(`Updated ${hospital.name} in hospital DB`);
+    }
 
     const booking = new ResourceBooking({
       hospitalName: hospital.name,
@@ -313,47 +369,15 @@ app.post("/api/resource-booking", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-app.get("/api/test-central-data", async (req, res) => {
+app.get("/api/central", verifyFirebaseToken, async (req, res) => {
   try {
-    // Query the 'resources' collection instead of 'central-data'
     const hospitals = await centralDB.collection("resources").find().toArray();
     res.status(200).json(hospitals);
   } catch (error) {
-    console.error("❌ Error fetching resources:", error);
-    res.status(500).json({ message: "Failed to fetch resources" });
+    console.error("❌ Error fetching central data:", error);
+    res.status(500).json({ message: "Failed to fetch central data" });
   }
 });
-
-const centralDB = mongoose.createConnection(process.env.MONGO_URI_CENTRAL, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
-
-centralDB.on("connected", async () => {
-  console.log("✅ MongoDB Central Connected");
-  const dbName = centralDB.name;
-  console.log("Connected to database:", dbName);
-  const collections = await centralDB.db.listCollections().toArray();
-  console.log("Collections in database:", collections.map(c => c.name));
-
-  const adminDb = centralDB.db.admin();
-  const dbList = await adminDb.listDatabases();
-  console.log("All databases in cluster:", dbList.databases.map(db => db.name));
-});
-
-centralDB.on("error", (err) => console.error("❌ MongoDB Central Connection Error:", err));
-
-const hospitalADB = mongoose.createConnection(process.env.MONGO_URI_A, { useNewUrlParser: true, useUnifiedTopology: true });
-hospitalADB.on("connected", () => console.log("✅ MongoDB Hospital-A Connected"));
-hospitalADB.on("error", (err) => console.error("❌ MongoDB Hospital-A Connection Error:", err));
-
-const hospitalBDB = mongoose.createConnection(process.env.MONGO_URI_B, { useNewUrlParser: true, useUnifiedTopology: true });
-hospitalBDB.on("connected", () => console.log("✅ MongoDB Hospital-B Connected"));
-hospitalBDB.on("error", (err) => console.error("❌ MongoDB Hospital-B Connection Error:", err));
-
-const hospitalCDB = mongoose.createConnection(process.env.MONGO_URI_C, { useNewUrlParser: true, useUnifiedTopology: true });
-hospitalCDB.on("connected", () => console.log("✅ MongoDB Hospital-C Connected"));
-hospitalCDB.on("error", (err) => console.error("❌ MongoDB Hospital-C Connection Error:", err));
 
 const hospitalRoutes = require("./routes/hospitalRoutes");
 const syncRoutes = require("./routes/syncRoutes")(centralDB, hospitalADB, hospitalBDB, hospitalCDB);
